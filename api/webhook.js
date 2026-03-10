@@ -72,6 +72,7 @@ async function buildAdminContext(db) {
 [ACTION]{"type":"edit_offer","offerId":"ID","changes":{"title":"...","expiryDate":"..."}}
 [ACTION]{"type":"delete_offer","offerId":"ID"}
 [ACTION]{"type":"edit_account","accountId":"ID","changes":{"fixedReply":"...","timesReply":"...","contactReply":"...","status":"نشط"}}
+[ACTION]{"type":"add_account","name":"...","category":"...","description":"...","status":"نشط"} ← أكونت جديد
 [ACTION]{"type":"add_reply","accountId":"ID","label":"...","text":"..."} ← رد جاهز للكوبي بس
 [ACTION]{"type":"add_info","accountId":"ID","question":"...","answer":"..."} ← معلومة يردها البوت لو حد سأل
 
@@ -150,6 +151,34 @@ async function execAction(db, actionStr, accs, offs) {
     const replies = (acc.extraReplies || []).concat([{ label: parsed.label, text: parsed.text }]);
     await db.collection("accounts").doc(acc.id).update({ extraReplies: replies, updatedAt: new Date().toISOString() });
     return `✅ تم إضافة الرد لـ ${acc.name}`;
+  }
+  if (t === "add_account") {
+    const id = "acc_" + Date.now();
+    await db.collection("accounts").doc(id).set({
+      id,
+      name: parsed.name || "",
+      category: parsed.category || "عام",
+      description: parsed.description || "",
+      status: parsed.status || "نشط",
+      avatar: "",
+      coverImage: "",
+      tags: [],
+      links: [],
+      extraReplies: [],
+      galleryImages: [],
+      trainedQA: [],
+      fixedReply: "",
+      timesReply: "",
+      contactReply: "",
+      pinned: false,
+      joinedDate: new Date().toISOString().slice(0,10),
+      updatedAt: new Date().toISOString(),
+    });
+    return `✅ تم إضافة الأكونت
+الاسم: ${parsed.name}
+الكاتيجوري: ${parsed.category || "عام"}
+
+تقدر تضيف تفاصيل أكتر من السايت ✏️`;
   }
   if (t === "add_info") {
     const acc = accs.find(a => a.id === parsed.accountId);
