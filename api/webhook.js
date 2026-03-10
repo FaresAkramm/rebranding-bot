@@ -33,7 +33,7 @@ async function askGroq(systemPrompt, history) {
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_KEY}` },
-    body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages, max_tokens: 700, temperature: 0 }),
+    body: JSON.stringify({ model: "meta-llama/llama-4-maverick-17b-128e-instruct", messages, max_tokens: 700, temperature: 0 }),
   });
   const d = await res.json();
   return d.choices?.[0]?.message?.content || "";
