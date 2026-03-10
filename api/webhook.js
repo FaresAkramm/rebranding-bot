@@ -49,44 +49,86 @@ async function buildAdminContext(db) {
   const now = new Date().toISOString().slice(0, 10);
   const activeOffs = offs.filter(o => !o.expiryDate || o.expiryDate >= now);
 
-  let ctx = `أنت مساعد إداري دقيق لوكالة Rebranding.
-قواعد:
-1. لو الأدمن طلب أكشن، استخدم [ACTION] وبعدين JSON.
-2. استخدم الـ ID الصح من القائمة بالظبط.
-3. لو مش متأكد من الأكونت، اسأل.
+  // Egypt timezone UTC+2
+  const now = new Date();
+  const egyptOffset = 2 * 60;
+  const egyptTime = new Date(now.getTime() + egyptOffset * 60 * 1000);
+  const today = egyptTime.toISOString().slice(0, 10);
+  console.log("Today:", today);
 
-الأكشنات:
+  let ctx = `أنت مساعد إداري لوكالة Rebranding. بتنفذ أوامر الأدمن بدقة.
+النهارده: ${today}
+
+قواعد صارمة جداً:
+1. لو الأدمن بيرد على سؤال زائر (زي "اه" أو "لأ") — مش هتعمل [ACTION] خالص، بس هتقول له "✅ تم حفظ الإجابة" وتوضحها.
+2. [ACTION] بتستخدمه فقط لو الأدمن طلب صراحة إضافة أو تعديل أو حذف.
+3. لو الأدمن قالك "ضيف عرض" لازم تسأله عن تاريخ الانتهاء لو مش قاله.
+4. expiryDate لازم تكون في المستقبل (بعد ${today}) — مش في الماضي.
+5. استخدم الـ ID الصح من القائمة بالظبط.
+6. لو مش متأكد من الأكونت، اسأل.
+
+الأكشنات (استخدم [ACTION] وبعدين JSON):
 [ACTION]{"type":"add_offer","accountId":"ID","title":"...","description":"...","content":"...","expiryDate":"YYYY-MM-DD","badge":"جديد"}
 [ACTION]{"type":"edit_offer","offerId":"ID","changes":{"title":"...","expiryDate":"..."}}
 [ACTION]{"type":"delete_offer","offerId":"ID"}
 [ACTION]{"type":"edit_account","accountId":"ID","changes":{"fixedReply":"...","timesReply":"...","contactReply":"...","status":"نشط"}}
-[ACTION]{"type":"add_reply","accountId":"ID","label":"...","text":"..."}
-[ACTION]{"type":"add_info","accountId":"ID","question":"...","answer":"..."}
+[ACTION]{"type":"add_reply","accountId":"ID","label":"...","text":"..."} ← رد جاهز للكوبي بس
+[ACTION]{"type":"add_info","accountId":"ID","question":"...","answer":"..."} ← معلومة يردها البوت لو حد سأل
+
+مهم: "أضف معلومة" أو "علّم البوت" = add_info دايماً.
+مهم: "أضف رد" أو "رد جاهز" = add_reply دايماً.
+مهم: لو الأدمن بيجاوب على سؤال زائر (رسالة فيها [ID:uq_]) = مش add_info ولا add_reply، الكود هيتولاها تلقائي.
 
 === الأكونتات ===\n`;
 
   accs.forEach(a => {
     const ao = activeOffs.filter(o => o.accountId === a.id);
-    ctx += `• ${a.name} | ID: ${a.id}\n`;
-    if (ao.length) ao.forEach(o => { ctx += `  ↳ ${o.title} | ID: ${o.id}\n`; });
+    ctx += `• ${a.name} | ID: ${a.id} | ${a.status || "نشط"}\n`;
+    if (ao.length) ao.forEach(o => {
+      ctx += `  ↳ عرض: ${o.title} | ID: ${o.id} | ينتهي: ${o.expiryDate || "مش محدد"}\n`;
+    });
   });
 
-  return { ctx, accs, offs: activeOffs };
+  return { ctx, accs, offs: activeOffs, allOffs: offs };
 }
 
 async function execAction(db, actionStr, accs, offs) {
   const parsed = JSON.parse(actionStr);
   const t = parsed.type;
+  // Egypt timezone UTC+2
+  const now = new Date();
+  const egyptOffset = 2 * 60;
+  const egyptTime = new Date(now.getTime() + egyptOffset * 60 * 1000);
+  const today = egyptTime.toISOString().slice(0, 10);
+  console.log("Today:", today);
+
   if (t === "add_offer") {
     const acc = accs.find(a => a.id === parsed.accountId);
-    if (!acc) return `❌ ID غلط: ${parsed.accountId}`;
+    if (!acc) return `❌ ID غلط: ${parsed.accountId}\nالأكونتات:\n${accs.map(a=>`• ${a.name}: ${a.id}`).join("\n")}`;
+    // Fix expiry date: if missing or in the past, set 1 year from now
+    const oneYearLater = new Date(egyptTime); oneYearLater.setFullYear(oneYearLater.getFullYear()+1);
+    const defaultExpiry = oneYearLater.toISOString().slice(0,10);
+    // Force default if no date, empty, or past date
+    const expiry = (parsed.expiryDate && String(parsed.expiryDate).trim() && parsed.expiryDate >= today) 
+      ? parsed.expiryDate 
+      : defaultExpiry;
     const id = "off_" + Date.now();
-    await db.collection("offers").doc(id).set({ id, accountId: parsed.accountId, title: parsed.title||"", description: parsed.description||"", content: parsed.content||"", image:"", link:"", expiryDate: parsed.expiryDate||"", badge: parsed.badge||"جديد", updatedAt: new Date().toISOString() });
-    return `✅ تم إضافة العرض: ${parsed.title}\nالأكونت: ${acc.name}`;
+    await db.collection("offers").doc(id).set({
+      id, accountId: parsed.accountId,
+      title: parsed.title || "", description: parsed.description || "",
+      content: parsed.content || "", image: "", link: "",
+      expiryDate: expiry, badge: parsed.badge || "جديد",
+      updatedAt: new Date().toISOString(),
+    });
+    const wasFixed = (!parsed.expiryDate || parsed.expiryDate < today);
+    return `✅ تم إضافة العرض\nالاسم: ${parsed.title}\nالأكونت: ${acc.name}\nينتهي: ${expiry}${wasFixed ? " (تم تحديده تلقائي)" : ""}`;
   }
   if (t === "edit_offer") {
     const off = offs.find(o => o.id === parsed.offerId);
     if (!off) return `❌ ID غلط: ${parsed.offerId}`;
+    if (parsed.changes?.expiryDate && parsed.changes.expiryDate < today) {
+      return `❌ تاريخ الانتهاء في الماضي! النهارده: ${today}`;
+    }
     await db.collection("offers").doc(off.id).update({ ...parsed.changes, updatedAt: new Date().toISOString() });
     return `✅ تم تعديل: ${off.title}`;
   }
@@ -113,34 +155,27 @@ async function execAction(db, actionStr, accs, offs) {
     const acc = accs.find(a => a.id === parsed.accountId);
     if (!acc) return `❌ ID غلط: ${parsed.accountId}`;
     const existing = acc.trainedQA || [];
-    const isDup = existing.find(x => x.q && x.q.trim() === (parsed.question||"").trim());
+    const isDup = existing.find(x => x.q && x.q.trim() === (parsed.question || "").trim());
     const newQA = isDup
-      ? existing.map(x => x.q.trim() === parsed.question.trim() ? {q:x.q, a:parsed.answer} : x)
-      : [...existing, {q: parsed.question, a: parsed.answer}];
+      ? existing.map(x => x.q.trim() === parsed.question.trim() ? { q: x.q, a: parsed.answer } : x)
+      : [...existing, { q: parsed.question, a: parsed.answer }];
     await db.collection("accounts").doc(acc.id).update({ trainedQA: newQA, updatedAt: new Date().toISOString() });
-    return `✅ تم إضافة المعلومة لـ ${acc.name}
-السؤال: ${parsed.question}
-الإجابة: ${parsed.answer}`;
+    return `✅ تم حفظ المعلومة في تدريب البوت\nالأكونت: ${acc.name}\nالسؤال: ${parsed.question}\nالإجابة: ${parsed.answer}`;
   }
   return `❌ أكشن مش معروف: ${t}`;
 }
 
 async function handleReply(db, replyText, originalText, accs) {
-  // Extract question ID
   const idMatch = originalText.match(/\[ID:(uq_\d+)\]/);
   if (!idMatch) return false;
   const qId = idMatch[1];
-
   const qDoc = await db.collection("unanswered_questions").doc(qId).get();
   if (!qDoc.exists) return false;
   const qData = qDoc.data();
-
   await db.collection("unanswered_questions").doc(qId).update({ a: replyText });
 
-  // Extract account ID directly - most reliable
   const aidMatch = originalText.match(/\[AID:([^\]]+)\]/);
   const accId = aidMatch ? aidMatch[1].trim() : null;
-
   let matched = accId ? accs.find(a => a.id === accId) : null;
   if (!matched) matched = accs.find(a => a.name === qData.accName);
 
@@ -178,7 +213,7 @@ module.exports = async (req, res) => {
   try {
     const db = getDB();
 
-    // Handle reply to unanswered question
+    // ══ REPLY TO UNANSWERED QUESTION — handle first, before AI ══
     if (message.reply_to_message) {
       const originalText = message.reply_to_message.text || "";
       if (originalText.includes("[ID:uq_")) {
@@ -186,12 +221,13 @@ module.exports = async (req, res) => {
         const accs = accsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
         const result = await handleReply(db, text, originalText, accs);
         if (result) {
-          await sendTG(chatId, `✅ تم حفظ الإجابة!\n\nالأكونت: ${result.accName}\nالسؤال: ${result.q}\nالإجابة: ${text}`);
+          await sendTG(chatId, `✅ تم حفظ الإجابة في تدريب البوت!\n\nالأكونت: ${result.accName}\nالسؤال: ${result.q}\nالإجابة: ${text}`);
           return res.status(200).send("ok");
         }
       }
     }
 
+    // ══ NORMAL ADMIN COMMAND ══
     const { ctx, accs, offs } = await buildAdminContext(db);
     if (!chatHistory[chatId]) chatHistory[chatId] = [];
     chatHistory[chatId].push({ role: "user", content: text });
@@ -208,7 +244,7 @@ module.exports = async (req, res) => {
         const result = await execAction(db, actionMatch[1], accs, offs);
         await sendTG(chatId, result);
       } catch(e) {
-        await sendTG(chatId, "❌ خطأ: " + e.message);
+        await sendTG(chatId, "❌ خطأ في التنفيذ: " + e.message);
       }
     } else {
       await sendTG(chatId, reply || "مش فاهم، حاول تاني.");
