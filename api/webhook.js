@@ -141,8 +141,20 @@ async function handleReply(db, replyText, originalText, accs) {
   if (!qDoc.exists) return false;
   const qData = qDoc.data();
   await db.collection("unanswered_questions").doc(qId).update({ a: replyText });
-  const matched = accs.find(a => a.name === qData.accName) ||
-                  accs.find(a => (qData.q || "").includes(a.name));
+
+  // Use accId directly if available - most reliable
+  const aidMatch = originalText.match(/\[AID:([^\]]+)\]/);
+  const accId = aidMatch ? aidMatch[1] : null;
+
+  let matched = null;
+  if (accId) {
+    matched = accs.find(a => a.id === accId);
+  }
+  // Fallback to name matching only if no accId
+  if (!matched) {
+    matched = accs.find(a => a.name === qData.accName);
+  }
+
   if (matched) {
     const existing = matched.trainedQA || [];
     const isDup = existing.find(x => x.q.trim() === qData.q.trim());
@@ -150,8 +162,9 @@ async function handleReply(db, replyText, originalText, accs) {
       ? existing.map(x => x.q.trim() === qData.q.trim() ? { q: x.q, a: replyText } : x)
       : [...existing, { q: qData.q, a: replyText }];
     await db.collection("accounts").doc(matched.id).update({ trainedQA: newQA, updatedAt: new Date().toISOString() });
+    return { q: qData.q, accName: matched.name };
   }
-  return qData.q;
+  return { q: qData.q, accName: qData.accName };
 }
 
 module.exports = async (req, res) => {
@@ -184,7 +197,7 @@ module.exports = async (req, res) => {
       const accs = accsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
       const savedQ = await handleReply(db, text, originalText, accs);
       if (savedQ) {
-        await sendTG(chatId, `✅ تم حفظ الإجابة!\n\nالسؤال: ${savedQ}\nالإجابة: ${text}`);
+        await sendTG(chatId, `✅ تم حفظ الإجابة في تدريب البوت!\n\nالأكونت: ${savedQ.accName}\nالسؤال: ${savedQ.q}\nالإجابة: ${text}`);
         return res.status(200).send("ok");
       }
     }
