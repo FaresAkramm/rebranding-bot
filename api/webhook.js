@@ -16,6 +16,17 @@ function getDB() {
 }
 
 const GROQ_KEY = process.env.GROQ_KEY;
+
+async function logActivity(db, type, label, detail) {
+  try {
+    const id = "act_" + Date.now();
+    await db.collection("activity_log").doc(id).set({
+      id, type, label, detail: detail || "",
+      source: "telegram",
+      createdAt: new Date().toISOString()
+    });
+  } catch(e) {}
+}
 const TG_TOKEN = process.env.TG_TOKEN;
 const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(",").map(s => s.trim());
 const chatHistory = {};
@@ -60,12 +71,22 @@ async function buildAdminContext(db) {
 النهارده: ${today}
 
 قواعد صارمة جداً:
-1. لو الأدمن بيرد على سؤال زائر (زي "اه" أو "لأ") — مش هتعمل [ACTION] خالص، بس هتقول له "✅ تم حفظ الإجابة" وتوضحها.
+1. لو الأدمن بيرد على سؤال زائر — مش هتعمل [ACTION]، بس قوله "✅ تم حفظ الإجابة".
 2. [ACTION] بتستخدمه فقط لو الأدمن طلب صراحة إضافة أو تعديل أو حذف.
 3. لو الأدمن قالك "ضيف عرض" لازم تسأله عن تاريخ الانتهاء لو مش قاله.
-4. expiryDate لازم تكون في المستقبل (بعد ${today}) — مش في الماضي.
+4. expiryDate لازم تكون في المستقبل (بعد ${today}).
 5. استخدم الـ ID الصح من القائمة بالظبط.
 6. لو مش متأكد من الأكونت، اسأل.
+
+🔑 ترجمة المصطلحات:
+- "الرد الثابت" / "fixed reply" / "الرسالة الترحيبية" = fixedReply
+- "مسح/حذف/امسح الرد الثابت" = edit_account + fixedReply: ""
+- "المواعيد" / "أوقات العمل" = timesReply
+- "التواصل" / "رقم الواتساب" / "الكونتاكت" = contactReply
+- "الردود الإضافية" / "ردود اختياري" / "أزرار الكوبي" = extraReplies (add_reply / delete_reply)
+- "صور المنيو" / "الألبوم" / "الصور" = galleryImages (delete_image)
+- "باسورد" / "كلمة المرور" / "password" = change_password
+- الباسورد الجديد = الكلمة أو الرقم بعد "لـ" أو "خليه" أو "to" أو "يكون"
 
 الأكشنات (استخدم [ACTION] وبعدين JSON):
 
@@ -79,11 +100,19 @@ async function buildAdminContext(db) {
 [ACTION]{"type":"delete_account","accountId":"ID"}
 [ACTION]{"type":"edit_account","accountId":"ID","changes":{"name":"...","category":"...","description":"...","fixedReply":"...","timesReply":"...","contactReply":"...","status":"نشط"}}
 
---- الردود الجاهزة (extraReplies) ---
-[ACTION]{"type":"add_reply","accountId":"ID","label":"...","text":"..."}
-[ACTION]{"type":"delete_reply","accountId":"ID","label":"..."}
+⚠️ تعديل حقول الأكونت:
+- "الرد الثابت" أو "fixed reply" أو "الرسالة الترحيبية" = fixedReply
+- لمسح الرد الثابت: [ACTION]{"type":"edit_account","accountId":"ID","changes":{"fixedReply":""}}
+- "مواعيد العمل" أو "الأوقات" = timesReply
+- لمسح المواعيد: [ACTION]{"type":"edit_account","accountId":"ID","changes":{"timesReply":""}}
+- "التواصل" أو "رقم الواتساب" = contactReply
+- لمسح التواصل: [ACTION]{"type":"edit_account","accountId":"ID","changes":{"contactReply":""}}
 
---- تدريب البوت (trainedQA) ---
+--- الردود الجاهزة (extraReplies = أزرار الكوبي في الكارد) ---
+[ACTION]{"type":"add_reply","accountId":"ID","label":"اسم الزرار","text":"نص الرد"}
+[ACTION]{"type":"delete_reply","accountId":"ID","label":"اسم الزرار"}
+
+--- تدريب البوت (trainedQA = أسئلة وأجوبة البوت) ---
 [ACTION]{"type":"add_info","accountId":"ID","question":"...","answer":"..."}
 [ACTION]{"type":"delete_info","accountId":"ID","question":"..."}
 
@@ -92,6 +121,9 @@ async function buildAdminContext(db) {
 
 --- الباسورد ---
 [ACTION]{"type":"change_password","newPassword":"..."}
+⚠️ أي جملة فيها "باسورد" أو "كلمة المرور" أو "password" مع رقم أو كلمة = change_password
+أمثلة: "غير الباسورد لـ 1234" / "عدل باسورد الأدمن خليه abc" / "change password to xyz"
+الباسورد الجديد = أي كلمة أو رقم بعد "لـ" أو "خليه" أو "to"
 
 مهم: "أضف معلومة" أو "علّم البوت" = add_info دايماً.
 مهم: "أضف رد" أو "رد جاهز" = add_reply دايماً.
@@ -148,26 +180,26 @@ async function execAction(db, actionStr, accs, offs) {
       return `❌ تاريخ الانتهاء في الماضي! النهارده: ${today}`;
     }
     await db.collection("offers").doc(off.id).update({ ...parsed.changes, updatedAt: new Date().toISOString() });
-    return `✅ تم تعديل: ${off.title}`;
+    await logActivity(db,"edit_offer","تعديل عرض: "+off.title,"تليجرام"); return `✅ تم تعديل: ${off.title}`;
   }
   if (t === "delete_offer") {
     const off = offs.find(o => o.id === parsed.offerId);
     if (!off) return `❌ ID غلط: ${parsed.offerId}`;
     await db.collection("offers").doc(parsed.offerId).delete();
-    return `🗑️ تم حذف: ${off.title}`;
+    await logActivity(db,"delete_offer","حذف عرض: "+off.title,"تليجرام"); return `🗑️ تم حذف: ${off.title}`;
   }
   if (t === "edit_account") {
     const acc = accs.find(a => a.id === parsed.accountId);
     if (!acc) return `❌ ID غلط: ${parsed.accountId}`;
     await db.collection("accounts").doc(acc.id).update({ ...parsed.changes, updatedAt: new Date().toISOString() });
-    return `✅ تم تعديل: ${acc.name}`;
+    await logActivity(db,"edit_account","تعديل أكونت: "+acc.name,"تليجرام"); return `✅ تم تعديل: ${acc.name}`;
   }
   if (t === "add_reply") {
     const acc = accs.find(a => a.id === parsed.accountId);
     if (!acc) return `❌ ID غلط: ${parsed.accountId}`;
     const replies = (acc.extraReplies || []).concat([{ label: parsed.label, text: parsed.text }]);
     await db.collection("accounts").doc(acc.id).update({ extraReplies: replies, updatedAt: new Date().toISOString() });
-    return `✅ تم إضافة الرد لـ ${acc.name}`;
+    await logActivity(db,"add_reply","إضافة رد لـ "+acc.name,"تليجرام"); return `✅ تم إضافة الرد لـ ${acc.name}`;
   }
   if (t === "add_account") {
     const id = "acc_" + Date.now();
