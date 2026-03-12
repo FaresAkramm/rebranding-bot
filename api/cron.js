@@ -1,13 +1,24 @@
 const { initializeApp, getApps } = require("firebase-admin/app");
 const { getFirestore } = require("firebase-admin/firestore");
 const { credential } = require("firebase-admin");
+const { createSign } = require("crypto");
 
 const SHEET_ID = "1wdBmHTmg5JdLujX-6P-MHXsoCjDwCLZWcF8BwJdlYEM";
 const TG_TOKEN = process.env.TG_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(",").map(s => s.trim());
+const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
 const SHEETS_CLIENT_EMAIL = process.env.SHEETS_CLIENT_EMAIL;
 const SHEETS_PRIVATE_KEY = process.env.SHEETS_PRIVATE_KEY?.replace(/\\n/g, "\n");
 
+// ══ HELPERS ══
+function getEgyptDate() {
+  return new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function getEgyptDatePlusDays(days) {
+  return new Date(Date.now() + 2 * 60 * 60 * 1000 + days * 86400000).toISOString().slice(0, 10);
+}
+
+// ══ FIREBASE ══
 function getDB() {
   if (!getApps().length) {
     initializeApp({
@@ -21,13 +32,18 @@ function getDB() {
   return getFirestore();
 }
 
+// ══ TELEGRAM ══
 async function sendTG(text) {
   for (const id of ADMIN_IDS) {
-    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: id, text, parse_mode: "HTML" }),
-    });
+    try {
+      await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: id, text, parse_mode: "HTML" }),
+      });
+    } catch (e) {
+      console.error(`sendTG error for ${id}:`, e.message);
+    }
   }
 }
 
@@ -43,7 +59,6 @@ async function getSheetsToken() {
     iat: now,
   })).toString("base64url");
 
-  const { createSign } = require("crypto");
   const sign = createSign("RSA-SHA256");
   sign.update(`${header}.${payload}`);
   const sig = sign.sign(SHEETS_PRIVATE_KEY, "base64url");
@@ -55,49 +70,54 @@ async function getSheetsToken() {
     body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
   });
   const data = await res.json();
+  if (!data.access_token) throw new Error("Sheets auth failed: " + JSON.stringify(data));
   return data.access_token;
+}
+
+async function ensureSheetHeaders(token, sheetName, headers) {
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName)}!A1:Z1`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  const data = await res.json();
+  if (!data.values?.[0]?.length) {
+    await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName)}!A1:append?valueInputOption=USER_ENTERED`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ values: [headers] }),
+      }
+    );
+  }
 }
 
 async function appendToSheet(token, sheetName, rows) {
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName)}!A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
-  await fetch(url, {
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({ values: rows }),
   });
-}
-
-async function ensureSheetHeaders(token, sheetName, headers) {
-  // Check if sheet has headers
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName)}!A1:Z1`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  const data = await res.json();
-  if (!data.values || !data.values[0] || data.values[0].length === 0) {
-    // Add headers
-    const setUrl = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName)}!A1:append?valueInputOption=USER_ENTERED`;
-    await fetch(setUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ values: [headers] }),
-    });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Sheets append error: ${err}`);
   }
 }
 
-// ══ FEATURE 3: تسجيل الأسئلة الجديدة في Sheets ══
+// ══ SYNC UNANSWERED QUESTIONS TO SHEETS ══
 async function syncUnansweredToSheets(db) {
   try {
     const token = await getSheetsToken();
+    const today = getEgyptDate();
+
     const snap = await db.collection("unanswered_questions").get();
-    const questions = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    
-    // Only today's questions
-    const today = new Date().toISOString().slice(0, 10);
-    const todayQs = questions.filter(q => q.createdAt && q.createdAt.slice(0, 10) === today);
-    
+    const todayQs = snap.docs
+      .map(d => ({ id: d.id, ...d.data() }))
+      .filter(q => q.createdAt?.slice(0, 10) === today);
+
     if (todayQs.length === 0) return 0;
 
     await ensureSheetHeaders(token, "الأسئلة", ["التاريخ", "الأكونت", "السؤال", "الإجابة", "الحالة"]);
-    
+
     const rows = todayQs.map(q => [
       q.createdAt ? new Date(q.createdAt).toLocaleString("ar-EG") : "",
       q.accName || "",
@@ -105,87 +125,86 @@ async function syncUnansweredToSheets(db) {
       q.a || "",
       q.a ? "✅ متجاوب" : "⏳ في الانتظار",
     ]);
-    
+
     await appendToSheet(token, "الأسئلة", rows);
     return todayQs.length;
-  } catch(e) {
+  } catch (e) {
     console.error("Sheets sync error:", e.message);
     return 0;
   }
 }
 
-// ══ FEATURE 4: تنبيه العروض ══
+// ══ CHECK OFFERS EXPIRY ══
 async function checkOffers(db) {
-  const snap = await db.collection("offers").get();
-  const accsSnap = await db.collection("accounts").get();
+  const today = getEgyptDate();
+  const in3Days = getEgyptDatePlusDays(3);
+
+  const [offsSnap, accsSnap] = await Promise.all([
+    db.collection("offers").get(),
+    db.collection("accounts").get(),
+  ]);
+
+  const offers = offsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
   const accs = accsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-  const offers = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  
-  const today = new Date();
-  const todayStr = today.toISOString().slice(0, 10);
-  const in3Days = new Date(today.getTime() + 3 * 86400000).toISOString().slice(0, 10);
-  
   const alerts = [];
 
   // عروض قربت تنتهي خلال 3 أيام
-  const expiringSoon = offers.filter(o => o.expiryDate && o.expiryDate >= todayStr && o.expiryDate <= in3Days);
+  const expiringSoon = offers.filter(o =>
+    o.expiryDate && o.expiryDate >= today && o.expiryDate <= in3Days
+  );
   for (const o of expiringSoon) {
     const acc = accs.find(a => a.id === o.accountId);
-    const daysLeft = Math.ceil((new Date(o.expiryDate) - today) / 86400000);
+    const daysLeft = Math.ceil(
+      (new Date(o.expiryDate).getTime() - new Date(today).getTime()) / 86400000
+    );
     alerts.push(`⚠️ عرض قرب ينتهي!\n📍 ${acc?.name || o.accountId}\n🎁 ${o.title}\n⏰ باقي ${daysLeft} يوم`);
   }
 
-  // أكونتات من غير عروض من أكتر من أسبوعين
+  // أكونتات نشطة من غير عروض
   const activeAccs = accs.filter(a => a.status === "نشط");
   for (const acc of activeAccs) {
-    const accOffers = offers.filter(o => o.accountId === acc.id && o.expiryDate >= todayStr);
-    if (accOffers.length === 0) {
-      alerts.push(`📭 مفيش عروض!\n📍 ${acc.name}\nمن غير عروض نشطة دلوقتي`);
+    const hasActive = offers.some(o => o.accountId === acc.id && o.expiryDate >= today);
+    if (!hasActive) {
+      alerts.push(`📭 مفيش عروض نشطة!\n📍 ${acc.name}`);
     }
   }
 
   return alerts;
 }
 
-// ══ FEATURE 3: أسئلة متكررة ══
+// ══ CHECK REPEATED UNANSWERED QUESTIONS ══
 async function checkRepeatedQuestions(db) {
   const snap = await db.collection("unanswered_questions").get();
-  const questions = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(q => !q.a);
-  
-  // Group by similar questions
+  const unanswered = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(q => !q.a);
+
   const qMap = {};
-  for (const q of questions) {
+  for (const q of unanswered) {
     const key = q.q?.trim().toLowerCase().slice(0, 30);
     if (!key) continue;
     if (!qMap[key]) qMap[key] = { q: q.q, accName: q.accName, count: 0 };
     qMap[key].count++;
   }
-  
-  const repeated = Object.values(qMap).filter(q => q.count >= 2);
-  return repeated;
+
+  return Object.values(qMap).filter(q => q.count >= 2);
 }
 
 // ══ DAILY REPORT ══
 async function sendDailyReport(db) {
-  const today = new Date().toISOString().slice(0, 10);
-  
-  // Get today's unanswered questions
+  const today = getEgyptDate();
+
   const snap = await db.collection("unanswered_questions").get();
   const allQs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
   const todayQs = allQs.filter(q => q.createdAt?.slice(0, 10) === today);
   const answered = todayQs.filter(q => q.a);
   const unanswered = todayQs.filter(q => !q.a);
 
-  // Sync to sheets
-  const synced = await syncUnansweredToSheets(db);
+  const [synced, offerAlerts, repeated] = await Promise.all([
+    syncUnansweredToSheets(db),
+    checkOffers(db),
+    checkRepeatedQuestions(db),
+  ]);
 
-  // Check offers
-  const offerAlerts = await checkOffers(db);
-
-  // Check repeated questions
-  const repeated = await checkRepeatedQuestions(db);
-
-  // Build report
+  // ── Main report ──
   let report = `📊 <b>تقرير يومي — ${today}</b>\n\n`;
   report += `❓ أسئلة النهارده: ${todayQs.length}\n`;
   report += `✅ متجاوب: ${answered.length}\n`;
@@ -202,14 +221,14 @@ async function sendDailyReport(db) {
 
   await sendTG(report);
 
-  // Send offer alerts separately
+  // ── Offer alerts (separate messages) ──
   for (const alert of offerAlerts.slice(0, 5)) {
     await sendTG(alert);
   }
 }
 
+// ══ VERCEL HANDLER ══
 module.exports = async (req, res) => {
-  // Verify it's a cron request
   if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).send("Unauthorized");
   }
@@ -217,9 +236,9 @@ module.exports = async (req, res) => {
   try {
     const db = getDB();
     await sendDailyReport(db);
-    res.status(200).json({ ok: true });
-  } catch(e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
+    return res.status(200).json({ ok: true, date: getEgyptDate() });
+  } catch (e) {
+    console.error("Cron error:", e);
+    return res.status(500).json({ error: e.message });
   }
 };
