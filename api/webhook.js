@@ -2,12 +2,6 @@ const { initializeApp, getApps } = require("firebase-admin/app");
 const { getFirestore } = require("firebase-admin/firestore");
 const { credential } = require("firebase-admin");
 
-// ══ HELPERS ══
-function getEgyptDate() {
-  const egyptTime = new Date(Date.now() + 2 * 60 * 60 * 1000);
-  return egyptTime.toISOString().slice(0, 10);
-}
-
 function getDB() {
   if (!getApps().length) {
     initializeApp({
@@ -23,179 +17,158 @@ function getDB() {
 
 const GROQ_KEY = process.env.GROQ_KEY;
 const TG_TOKEN = process.env.TG_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
-
-// In-memory chat history (resets on cold start — acceptable for Vercel)
+const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(",").map(s => s.trim());
 const chatHistory = {};
 
-// ══ TELEGRAM ══
 async function sendTG(chatId, text) {
-  try {
-    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
-    });
-  } catch (e) {
-    console.error("sendTG error:", e.message);
-  }
+  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text }),
+  });
 }
 
-// ══ GROQ ══
 async function askGroq(systemPrompt, history) {
   const messages = [{ role: "system", content: systemPrompt }, ...history];
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_KEY}` },
-    body: JSON.stringify({
-      model: "meta-llama/llama-4-maverick-17b-128e-instruct",
-      messages,
-      max_tokens: 700,
-      temperature: 0,
-    }),
+    body: JSON.stringify({ model: "meta-llama/llama-4-maverick-17b-128e-instruct", messages, max_tokens: 700, temperature: 0 }),
   });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Groq error ${res.status}: ${err}`);
-  }
   const d = await res.json();
-  return d.choices?.[0]?.message?.content?.trim() || "";
+  return d.choices?.[0]?.message?.content || "";
 }
 
-// ══ BUILD SYSTEM PROMPT ══
 async function buildAdminContext(db) {
-  const today = getEgyptDate();
-
   const [accsSnap, offsSnap] = await Promise.all([
     db.collection("accounts").get(),
     db.collection("offers").get(),
   ]);
-
   const accs = accsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-  const allOffs = offsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-  const activeOffs = allOffs.filter(o => !o.expiryDate || o.expiryDate >= today);
+  const offs = offsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+  const now = new Date().toISOString().slice(0, 10);
+  const activeOffs = offs.filter(o => !o.expiryDate || o.expiryDate >= now);
+
+  // Egypt timezone UTC+2
+  const now = new Date();
+  const egyptOffset = 2 * 60;
+  const egyptTime = new Date(now.getTime() + egyptOffset * 60 * 1000);
+  const today = egyptTime.toISOString().slice(0, 10);
+  console.log("Today:", today);
 
   let ctx = `أنت مساعد إداري لوكالة Rebranding. بتنفذ أوامر الأدمن بدقة.
 النهارده: ${today}
 
 قواعد صارمة جداً:
-1. لو الأدمن بيرد على سؤال زائر (زي "اه" أو "لأ") — مش هتعمل [ACTION] خالص، بس هتقوله "✅ تم حفظ الإجابة" وتوضحها.
+1. لو الأدمن بيرد على سؤال زائر (زي "اه" أو "لأ") — مش هتعمل [ACTION] خالص، بس هتقول له "✅ تم حفظ الإجابة" وتوضحها.
 2. [ACTION] بتستخدمه فقط لو الأدمن طلب صراحة إضافة أو تعديل أو حذف.
 3. لو الأدمن قالك "ضيف عرض" لازم تسأله عن تاريخ الانتهاء لو مش قاله.
 4. expiryDate لازم تكون في المستقبل (بعد ${today}) — مش في الماضي.
 5. استخدم الـ ID الصح من القائمة بالظبط.
 6. لو مش متأكد من الأكونت، اسأل.
 
-الأكشنات المتاحة (استخدم [ACTION] وبعدين JSON على سطر واحد):
+الأكشنات (استخدم [ACTION] وبعدين JSON):
+
+--- العروض ---
 [ACTION]{"type":"add_offer","accountId":"ID","title":"...","description":"...","content":"...","expiryDate":"YYYY-MM-DD","badge":"جديد"}
 [ACTION]{"type":"edit_offer","offerId":"ID","changes":{"title":"...","expiryDate":"..."}}
 [ACTION]{"type":"delete_offer","offerId":"ID"}
-[ACTION]{"type":"edit_account","accountId":"ID","changes":{"fixedReply":"...","timesReply":"...","contactReply":"...","status":"نشط"}}
+
+--- الأكونتات ---
 [ACTION]{"type":"add_account","name":"...","category":"...","description":"...","status":"نشط"}
+[ACTION]{"type":"delete_account","accountId":"ID"}
+[ACTION]{"type":"edit_account","accountId":"ID","changes":{"name":"...","category":"...","description":"...","fixedReply":"...","timesReply":"...","contactReply":"...","status":"نشط"}}
+
+--- الردود الجاهزة (extraReplies) ---
 [ACTION]{"type":"add_reply","accountId":"ID","label":"...","text":"..."}
+[ACTION]{"type":"delete_reply","accountId":"ID","label":"..."}
+
+--- تدريب البوت (trainedQA) ---
 [ACTION]{"type":"add_info","accountId":"ID","question":"...","answer":"..."}
+[ACTION]{"type":"delete_info","accountId":"ID","question":"..."}
 
-تذكر دايماً:
-• "أضف معلومة" أو "علّم البوت" = add_info
-• "أضف رد" أو "رد جاهز" = add_reply
-• لو الأدمن بيجاوب على سؤال زائر (رسالة فيها [ID:uq_]) = الكود بيتولاها تلقائي، متستخدمش [ACTION]
+--- الصور ---
+[ACTION]{"type":"delete_image","accountId":"ID","imageUrl":"..."}
 
-=== الأكونتات ===
-`;
+--- الباسورد ---
+[ACTION]{"type":"change_password","newPassword":"..."}
+
+مهم: "أضف معلومة" أو "علّم البوت" = add_info دايماً.
+مهم: "أضف رد" أو "رد جاهز" = add_reply دايماً.
+مهم: لو الأدمن بيجاوب على سؤال زائر (رسالة فيها [ID:uq_]) = مش add_info ولا add_reply، الكود هيتولاها تلقائي.
+
+=== الأكونتات ===\n`;
 
   accs.forEach(a => {
     const ao = activeOffs.filter(o => o.accountId === a.id);
     ctx += `• ${a.name} | ID: ${a.id} | ${a.status || "نشط"}\n`;
-    ao.forEach(o => {
+    if (ao.length) ao.forEach(o => {
       ctx += `  ↳ عرض: ${o.title} | ID: ${o.id} | ينتهي: ${o.expiryDate || "مش محدد"}\n`;
     });
   });
 
-  return { ctx, accs, activeOffs, allOffs, today };
+  return { ctx, accs, offs: activeOffs, allOffs: offs };
 }
 
-// ══ EXECUTE ACTION ══
-async function execAction(db, actionStr, accs, activeOffs, today) {
-  let parsed;
-  try {
-    parsed = JSON.parse(actionStr);
-  } catch (e) {
-    return `❌ JSON غلط: ${e.message}\n${actionStr}`;
-  }
-
+async function execAction(db, actionStr, accs, offs) {
+  const parsed = JSON.parse(actionStr);
   const t = parsed.type;
+  // Egypt timezone UTC+2
+  const now = new Date();
+  const egyptOffset = 2 * 60;
+  const egyptTime = new Date(now.getTime() + egyptOffset * 60 * 1000);
+  const today = egyptTime.toISOString().slice(0, 10);
+  console.log("Today:", today);
 
   if (t === "add_offer") {
     const acc = accs.find(a => a.id === parsed.accountId);
-    if (!acc) {
-      return `❌ ID غلط: ${parsed.accountId}\nالأكونتات المتاحة:\n${accs.map(a => `• ${a.name}: ${a.id}`).join("\n")}`;
-    }
-    // Auto-fix expiry date if missing or in the past
-    const oneYearLater = new Date(Date.now() + 2 * 60 * 60 * 1000);
-    oneYearLater.setFullYear(oneYearLater.getFullYear() + 1);
-    const defaultExpiry = oneYearLater.toISOString().slice(0, 10);
-    const expiry = (parsed.expiryDate && String(parsed.expiryDate).trim() && parsed.expiryDate >= today)
-      ? parsed.expiryDate
+    if (!acc) return `❌ ID غلط: ${parsed.accountId}\nالأكونتات:\n${accs.map(a=>`• ${a.name}: ${a.id}`).join("\n")}`;
+    // Fix expiry date: if missing or in the past, set 1 year from now
+    const oneYearLater = new Date(egyptTime); oneYearLater.setFullYear(oneYearLater.getFullYear()+1);
+    const defaultExpiry = oneYearLater.toISOString().slice(0,10);
+    // Force default if no date, empty, or past date
+    const expiry = (parsed.expiryDate && String(parsed.expiryDate).trim() && parsed.expiryDate >= today) 
+      ? parsed.expiryDate 
       : defaultExpiry;
-    const wasFixed = !parsed.expiryDate || parsed.expiryDate < today;
-
     const id = "off_" + Date.now();
     await db.collection("offers").doc(id).set({
-      id,
-      accountId: parsed.accountId,
-      title: parsed.title || "",
-      description: parsed.description || "",
-      content: parsed.content || "",
-      image: "",
-      link: "",
-      expiryDate: expiry,
-      badge: parsed.badge || "جديد",
+      id, accountId: parsed.accountId,
+      title: parsed.title || "", description: parsed.description || "",
+      content: parsed.content || "", image: "", link: "",
+      expiryDate: expiry, badge: parsed.badge || "جديد",
       updatedAt: new Date().toISOString(),
     });
+    const wasFixed = (!parsed.expiryDate || parsed.expiryDate < today);
     return `✅ تم إضافة العرض\nالاسم: ${parsed.title}\nالأكونت: ${acc.name}\nينتهي: ${expiry}${wasFixed ? " (تم تحديده تلقائي)" : ""}`;
   }
-
   if (t === "edit_offer") {
-    const off = activeOffs.find(o => o.id === parsed.offerId);
+    const off = offs.find(o => o.id === parsed.offerId);
     if (!off) return `❌ ID غلط: ${parsed.offerId}`;
     if (parsed.changes?.expiryDate && parsed.changes.expiryDate < today) {
       return `❌ تاريخ الانتهاء في الماضي! النهارده: ${today}`;
     }
-    await db.collection("offers").doc(off.id).update({
-      ...parsed.changes,
-      updatedAt: new Date().toISOString(),
-    });
+    await db.collection("offers").doc(off.id).update({ ...parsed.changes, updatedAt: new Date().toISOString() });
     return `✅ تم تعديل: ${off.title}`;
   }
-
   if (t === "delete_offer") {
-    const off = activeOffs.find(o => o.id === parsed.offerId);
+    const off = offs.find(o => o.id === parsed.offerId);
     if (!off) return `❌ ID غلط: ${parsed.offerId}`;
     await db.collection("offers").doc(parsed.offerId).delete();
     return `🗑️ تم حذف: ${off.title}`;
   }
-
   if (t === "edit_account") {
     const acc = accs.find(a => a.id === parsed.accountId);
     if (!acc) return `❌ ID غلط: ${parsed.accountId}`;
-    await db.collection("accounts").doc(acc.id).update({
-      ...parsed.changes,
-      updatedAt: new Date().toISOString(),
-    });
+    await db.collection("accounts").doc(acc.id).update({ ...parsed.changes, updatedAt: new Date().toISOString() });
     return `✅ تم تعديل: ${acc.name}`;
   }
-
   if (t === "add_reply") {
     const acc = accs.find(a => a.id === parsed.accountId);
     if (!acc) return `❌ ID غلط: ${parsed.accountId}`;
-    const replies = [...(acc.extraReplies || []), { label: parsed.label, text: parsed.text }];
-    await db.collection("accounts").doc(acc.id).update({
-      extraReplies: replies,
-      updatedAt: new Date().toISOString(),
-    });
+    const replies = (acc.extraReplies || []).concat([{ label: parsed.label, text: parsed.text }]);
+    await db.collection("accounts").doc(acc.id).update({ extraReplies: replies, updatedAt: new Date().toISOString() });
     return `✅ تم إضافة الرد لـ ${acc.name}`;
   }
-
   if (t === "add_account") {
     const id = "acc_" + Date.now();
     await db.collection("accounts").doc(id).set({
@@ -215,82 +188,105 @@ async function execAction(db, actionStr, accs, activeOffs, today) {
       timesReply: "",
       contactReply: "",
       pinned: false,
-      joinedDate: getEgyptDate(),
+      joinedDate: new Date().toISOString().slice(0,10),
       updatedAt: new Date().toISOString(),
     });
-    return `✅ تم إضافة الأكونت\nالاسم: ${parsed.name}\nالكاتيجوري: ${parsed.category || "عام"}\n\nتقدر تضيف تفاصيل أكتر من السايت ✏️`;
-  }
+    return `✅ تم إضافة الأكونت
+الاسم: ${parsed.name}
+الكاتيجوري: ${parsed.category || "عام"}
 
+تقدر تضيف تفاصيل أكتر من السايت ✏️`;
+  }
   if (t === "add_info") {
     const acc = accs.find(a => a.id === parsed.accountId);
     if (!acc) return `❌ ID غلط: ${parsed.accountId}`;
     const existing = acc.trainedQA || [];
-    const isDup = existing.find(x => x.q?.trim() === (parsed.question || "").trim());
+    const isDup = existing.find(x => x.q && x.q.trim() === (parsed.question || "").trim());
     const newQA = isDup
-      ? existing.map(x => x.q?.trim() === parsed.question?.trim() ? { q: x.q, a: parsed.answer } : x)
+      ? existing.map(x => x.q.trim() === parsed.question.trim() ? { q: x.q, a: parsed.answer } : x)
       : [...existing, { q: parsed.question, a: parsed.answer }];
-    await db.collection("accounts").doc(acc.id).update({
-      trainedQA: newQA,
-      updatedAt: new Date().toISOString(),
-    });
+    await db.collection("accounts").doc(acc.id).update({ trainedQA: newQA, updatedAt: new Date().toISOString() });
     return `✅ تم حفظ المعلومة في تدريب البوت\nالأكونت: ${acc.name}\nالسؤال: ${parsed.question}\nالإجابة: ${parsed.answer}`;
   }
-
+  if (t === "delete_account") {
+    const acc = accs.find(a => a.id === parsed.accountId);
+    if (!acc) return `❌ ID غلط: ${parsed.accountId}`;
+    await db.collection("accounts").doc(parsed.accountId).delete();
+    // Delete account offers too
+    const offSnap = await db.collection("offers").where("accountId","==",parsed.accountId).get();
+    const batch = db.batch();
+    offSnap.docs.forEach(d => batch.delete(d.ref));
+    if(offSnap.docs.length) await batch.commit();
+    return `🗑️ تم حذف الأكونت: ${acc.name}\nوكمان اتحذف ${offSnap.docs.length} عرض معاه`;
+  }
+  if (t === "delete_reply") {
+    const acc = accs.find(a => a.id === parsed.accountId);
+    if (!acc) return `❌ ID غلط: ${parsed.accountId}`;
+    const replies = (acc.extraReplies || []).filter(r => r.label !== parsed.label);
+    await db.collection("accounts").doc(acc.id).update({ extraReplies: replies, updatedAt: new Date().toISOString() });
+    return `✅ تم حذف الرد "${parsed.label}" من ${acc.name}`;
+  }
+  if (t === "delete_info") {
+    const acc = accs.find(a => a.id === parsed.accountId);
+    if (!acc) return `❌ ID غلط: ${parsed.accountId}`;
+    const qa = (acc.trainedQA || []).filter(q => q.q !== parsed.question);
+    await db.collection("accounts").doc(acc.id).update({ trainedQA: qa, updatedAt: new Date().toISOString() });
+    return `✅ تم حذف السؤال من تدريب البوت\nالأكونت: ${acc.name}`;
+  }
+  if (t === "delete_image") {
+    const acc = accs.find(a => a.id === parsed.accountId);
+    if (!acc) return `❌ ID غلط: ${parsed.accountId}`;
+    const imgs = (acc.galleryImages || []).filter(img => img !== parsed.imageUrl);
+    await db.collection("accounts").doc(acc.id).update({ galleryImages: imgs, updatedAt: new Date().toISOString() });
+    return `✅ تم حذف الصورة من ألبوم ${acc.name}`;
+  }
+  if (t === "change_password") {
+    if (!parsed.newPassword || parsed.newPassword.length < 4) return `❌ الباسورد لازم يكون 4 حروف على الأقل`;
+    await db.collection("settings").doc("admin").set({ password: parsed.newPassword, updatedAt: new Date().toISOString() }, { merge: true });
+    return `✅ تم تغيير باسورد الأدمن بنجاح!\nالباسورد الجديد: ${parsed.newPassword}`;
+  }
   return `❌ أكشن مش معروف: ${t}`;
 }
 
-// ══ HANDLE REPLY TO UNANSWERED QUESTION ══
 async function handleReply(db, replyText, originalText, accs) {
   const idMatch = originalText.match(/\[ID:(uq_\d+)\]/);
   if (!idMatch) return false;
-
   const qId = idMatch[1];
   const qDoc = await db.collection("unanswered_questions").doc(qId).get();
   if (!qDoc.exists) return false;
-
   const qData = qDoc.data();
   await db.collection("unanswered_questions").doc(qId).update({ a: replyText });
 
-  // Try to match account by ID first, then by name
   const aidMatch = originalText.match(/\[AID:([^\]]+)\]/);
   const accId = aidMatch ? aidMatch[1].trim() : null;
-  const matched = (accId ? accs.find(a => a.id === accId) : null)
-    || accs.find(a => a.name === qData.accName);
+  let matched = accId ? accs.find(a => a.id === accId) : null;
+  if (!matched) matched = accs.find(a => a.name === qData.accName);
 
   if (matched) {
     const existing = matched.trainedQA || [];
-    const isDup = existing.find(x => x.q?.trim() === qData.q?.trim());
+    const isDup = existing.find(x => x.q.trim() === qData.q.trim());
     const newQA = isDup
-      ? existing.map(x => x.q?.trim() === qData.q?.trim() ? { q: x.q, a: replyText } : x)
+      ? existing.map(x => x.q.trim() === qData.q.trim() ? { q: x.q, a: replyText } : x)
       : [...existing, { q: qData.q, a: replyText }];
-    await db.collection("accounts").doc(matched.id).update({
-      trainedQA: newQA,
-      updatedAt: new Date().toISOString(),
-    });
+    await db.collection("accounts").doc(matched.id).update({ trainedQA: newQA, updatedAt: new Date().toISOString() });
     return { q: qData.q, accName: matched.name };
   }
-
   return { q: qData.q, accName: qData.accName };
 }
 
-// ══ MAIN HANDLER ══
 module.exports = async (req, res) => {
   if (req.method !== "POST") return res.status(200).send("ok");
-
   const { message } = req.body || {};
   if (!message) return res.status(200).send("ok");
 
   const chatId = String(message.chat?.id);
   const text = (message.text || "").trim();
-  if (!text) return res.status(200).send("ok");
 
-  // Auth check
   if (ADMIN_IDS.length && !ADMIN_IDS.includes(chatId)) {
     await sendTG(chatId, "⛔ مش مصرح ليك.");
     return res.status(200).send("ok");
   }
 
-  // Reset command
   if (text === "/start" || text === "/reset") {
     chatHistory[chatId] = [];
     await sendTG(chatId, "👋 أهلاً! قولي إيه اللي عايزه.");
@@ -300,13 +296,13 @@ module.exports = async (req, res) => {
   try {
     const db = getDB();
 
-    // ══ HANDLE REPLY TO UNANSWERED QUESTION (before AI) ══
+    // ══ REPLY TO UNANSWERED QUESTION — handle first, before AI ══
     if (message.reply_to_message) {
-      const origText = message.reply_to_message.text || "";
-      if (origText.includes("[ID:uq_")) {
+      const originalText = message.reply_to_message.text || "";
+      if (originalText.includes("[ID:uq_")) {
         const accsSnap = await db.collection("accounts").get();
         const accs = accsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-        const result = await handleReply(db, text, origText, accs);
+        const result = await handleReply(db, text, originalText, accs);
         if (result) {
           await sendTG(chatId, `✅ تم حفظ الإجابة في تدريب البوت!\n\nالأكونت: ${result.accName}\nالسؤال: ${result.q}\nالإجابة: ${text}`);
           return res.status(200).send("ok");
@@ -315,35 +311,31 @@ module.exports = async (req, res) => {
     }
 
     // ══ NORMAL ADMIN COMMAND ══
-    const { ctx, accs, activeOffs, today } = await buildAdminContext(db);
-
+    const { ctx, accs, offs } = await buildAdminContext(db);
     if (!chatHistory[chatId]) chatHistory[chatId] = [];
     chatHistory[chatId].push({ role: "user", content: text });
-    // Keep last 6 messages only
     if (chatHistory[chatId].length > 6) chatHistory[chatId] = chatHistory[chatId].slice(-6);
 
     const reply = await askGroq(ctx, chatHistory[chatId]);
     chatHistory[chatId].push({ role: "assistant", content: reply });
 
-    // Check for action
     const actionMatch = reply.match(/\[ACTION\]\s*(\{[\s\S]*?\})/);
     if (actionMatch) {
       const cleanReply = reply.replace(/\[ACTION\]\s*\{[\s\S]*?\}/, "").trim();
       if (cleanReply) await sendTG(chatId, cleanReply);
       try {
-        const result = await execAction(db, actionMatch[1], accs, activeOffs, today);
+        const result = await execAction(db, actionMatch[1], accs, offs);
         await sendTG(chatId, result);
-      } catch (e) {
+      } catch(e) {
         await sendTG(chatId, "❌ خطأ في التنفيذ: " + e.message);
       }
     } else {
       await sendTG(chatId, reply || "مش فاهم، حاول تاني.");
     }
-
   } catch (e) {
-    console.error("Webhook error:", e);
+    console.error(e);
     await sendTG(chatId, "❌ خطأ: " + e.message);
   }
 
-  return res.status(200).send("ok");
+  res.status(200).send("ok");
 };
